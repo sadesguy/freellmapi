@@ -199,6 +199,8 @@ const toolChoiceSchema = z.union([
   }),
 ]);
 
+const stopSchema = z.union([z.string(), z.array(z.string()).min(1).max(4)]);
+
 const chatCompletionSchema = z.object({
   messages: z.array(z.union([
     systemMessageSchema,
@@ -210,10 +212,22 @@ const chatCompletionSchema = z.object({
   temperature: z.number().min(0).max(2).optional(),
   max_tokens: z.number().int().positive().optional(),
   top_p: z.number().min(0).max(1).optional(),
+  stop: stopSchema.optional(),
   stream: z.boolean().optional(),
   tools: z.array(toolDefinitionSchema).optional(),
   tool_choice: toolChoiceSchema.optional(),
   parallel_tool_calls: z.boolean().optional(),
+});
+
+const completionSchema = z.object({
+  model: z.string().optional(),
+  prompt: z.string(),
+  suffix: z.string().optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  max_tokens: z.number().int().positive().optional(),
+  top_p: z.number().min(0).max(1).optional(),
+  stop: stopSchema.optional(),
+  stream: z.boolean().optional(),
 });
 
 export function isRetryableError(err: any): boolean {
@@ -313,6 +327,268 @@ proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
   }
 });
 
+function completionPromptToMessages(prompt: string, suffix?: string): ChatMessage[] {
+  const hasSuffix = suffix !== undefined && suffix.length > 0;
+  return [
+    {
+      role: 'system',
+      content: [
+        'You are a code autocomplete engine.',
+        'Complete at the cursor and return only the text to insert.',
+        'Do not include markdown fences, explanations, or repeat surrounding code.',
+      ].join(' '),
+    },
+    {
+      role: 'user',
+      content: hasSuffix
+        ? `Prefix before cursor:\n${prompt}\n\nSuffix after cursor:\n${suffix}\n\nCompletion to insert:`
+        : `Prefix before cursor:\n${prompt}\n\nCompletion to insert:`,
+    },
+  ];
+}
+
+function completionTextFromChat(result: any): string {
+  return contentToString(result?.choices?.[0]?.message?.content ?? '');
+}
+
+function completionIdFromChat(id: string | undefined): string {
+  if (!id) return `cmpl-${Date.now()}`;
+  return id.startsWith('cmpl-') ? id : `cmpl-${id}`;
+}
+
+function legacyCompletionChunk(route: RouteResult, chunk: any, text: string) {
+  return {
+    id: completionIdFromChat(chunk?.id),
+    object: 'text_completion',
+    created: chunk?.created ?? Math.floor(Date.now() / 1000),
+    model: route.modelId,
+    choices: [{
+      text,
+      index: chunk?.choices?.[0]?.index ?? 0,
+      logprobs: null,
+      finish_reason: chunk?.choices?.[0]?.finish_reason ?? null,
+    }],
+  };
+}
+
+// OpenAI-compatible legacy completions endpoint. VS Code ghost-text clients
+// (notably Continue autocomplete) commonly use /v1/completions with
+// prompt/suffix context, while freellmapi providers are chat-first. This shim
+// translates that autocomplete shape into the existing router and returns the
+// legacy text_completion shape those clients expect.
+proxyRouter.post('/completions', async (req: Request, res: Response) => {
+  const start = Date.now();
+
+  const token = extractApiToken(req);
+  const unifiedKey = getUnifiedApiKey();
+  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+    res.status(401).json({
+      error: { message: 'Invalid API key', type: 'authentication_error' },
+    });
+    return;
+  }
+
+  const parsed = completionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: {
+        message: `Invalid request: ${parsed.error.errors.map(e => e.message).join(', ')}`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+
+  const {
+    model: requestedModel,
+    prompt,
+    suffix,
+    temperature,
+    top_p,
+    stop,
+    stream,
+  } = parsed.data;
+  const max_tokens = parsed.data.max_tokens ?? 128;
+  const messages = completionPromptToMessages(prompt, suffix);
+  const estimatedInputTokens = Math.ceil((prompt.length + (suffix?.length ?? 0)) / 4);
+  const estimatedTotal = estimatedInputTokens + max_tokens;
+
+  let preferredModel: number | undefined;
+  if (isAutoModel(requestedModel)) {
+    preferredModel = undefined;
+  } else if (requestedModel) {
+    const db = getDb();
+    const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    if (enabled) {
+      preferredModel = enabled.id;
+    } else {
+      const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+      const reason = disabled ? 'is disabled' : 'is not in the catalog';
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+  }
+
+  const skipKeys = new Set<string>();
+  let lastError: any = null;
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    let route: RouteResult;
+    try {
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false);
+    } catch (err: any) {
+      if (lastError) {
+        const safeLastError = sanitizeProviderErrorMessage(lastError.message);
+        res.status(429).json({
+          error: {
+            message: `All models rate-limited. Last error: ${safeLastError}`,
+            type: 'rate_limit_error',
+          },
+        });
+      } else {
+        res.status(err.status ?? 503).json({
+          error: { message: err.message, type: 'routing_error' },
+        });
+      }
+      return;
+    }
+
+    recordRequest(route.platform, route.modelId, route.keyId);
+
+    try {
+      if (stream) {
+        let totalOutputTokens = 0;
+        let streamStarted = false;
+        let ttfbMs: number | null = null;
+        try {
+          const gen = route.provider.streamChatCompletion(
+            route.apiKey,
+            messages,
+            route.modelId,
+            { temperature, max_tokens, top_p, stop },
+          );
+
+          for await (const chunk of gen) {
+            if (!streamStarted) {
+              ttfbMs = Date.now() - start;
+              res.setHeader('Content-Type', 'text/event-stream');
+              res.setHeader('Cache-Control', 'no-cache');
+              res.setHeader('Connection', 'keep-alive');
+              res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+              if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+              streamStarted = true;
+            }
+            const text = streamChunkText(chunk);
+            totalOutputTokens += Math.ceil(text.length / 4);
+            res.write(`data: ${JSON.stringify(legacyCompletionChunk(route, chunk, text))}\n\n`);
+          }
+
+          if (!streamStarted) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+          }
+          res.write('data: [DONE]\n\n');
+          res.end();
+
+          recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
+          recordSuccess(route.modelDbId);
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs);
+          return;
+        } catch (streamErr: any) {
+          if (streamStarted) {
+            console.error(`[Proxy] Mid-stream completion error from ${route.displayName}:`, streamErr.message);
+            const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
+            try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
+            try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message));
+            return;
+          }
+          throw streamErr;
+        }
+      } else {
+        const result = await route.provider.chatCompletion(
+          route.apiKey,
+          messages,
+          route.modelId,
+          { temperature, max_tokens, top_p, stop },
+        );
+
+        const text = completionTextFromChat(result);
+        const totalTokens = result.usage?.total_tokens ?? 0;
+        recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
+        recordSuccess(route.modelDbId);
+
+        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+        if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+        res.json({
+          id: completionIdFromChat(result.id),
+          object: 'text_completion',
+          created: result.created ?? Math.floor(Date.now() / 1000),
+          model: route.modelId,
+          choices: [{
+            text,
+            index: result.choices?.[0]?.index ?? 0,
+            logprobs: null,
+            finish_reason: result.choices?.[0]?.finish_reason ?? 'stop',
+          }],
+          usage: result.usage,
+        });
+
+        logRequest(
+          route.platform, route.modelId, route.keyId, 'success',
+          result.usage?.prompt_tokens ?? 0,
+          result.usage?.completion_tokens ?? 0,
+          Date.now() - start, null,
+        );
+        return;
+      }
+    } catch (err: any) {
+      const latency = Date.now() - start;
+      const safeError = sanitizeProviderErrorMessage(err.message);
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
+
+      if (isRetryableError(err)) {
+        const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
+        skipKeys.add(skipId);
+        setCooldown(
+          route.platform,
+          route.modelId,
+          route.keyId,
+          getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
+            rpd: route.rpdLimit,
+            tpd: route.tpdLimit,
+          }),
+        );
+        recordRateLimitHit(route.modelDbId);
+        lastError = err;
+        console.log(`[Proxy] ${safeError.slice(0, 60)} from ${route.displayName}, falling back (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        continue;
+      }
+
+      res.status(502).json({
+        error: {
+          message: `Provider error (${route.displayName}): ${safeError}`,
+          type: 'provider_error',
+        },
+      });
+      return;
+    }
+  }
+
+  res.status(429).json({
+    error: {
+      message: `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${sanitizeProviderErrorMessage(lastError?.message)}`,
+      type: 'rate_limit_error',
+    },
+  });
+});
+
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
 
@@ -340,7 +616,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
-  const { model: requestedModel, temperature, max_tokens, top_p, stream, tools, tool_choice, parallel_tool_calls } = parsed.data;
+  const { model: requestedModel, temperature, max_tokens, top_p, stop, stream, tools, tool_choice, parallel_tool_calls } = parsed.data;
   const messages: ChatMessage[] = parsed.data.messages.map((m): ChatMessage => {
     if (m.role === 'assistant') {
       const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
@@ -482,7 +758,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, messages, route.modelId,
-            { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
+            { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
           );
 
           for await (const chunk of gen) {
@@ -537,7 +813,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       } else {
         const result = await route.provider.chatCompletion(
           route.apiKey, messages, route.modelId,
-          { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
+          { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
         );
 
         const totalTokens = result.usage?.total_tokens ?? 0;

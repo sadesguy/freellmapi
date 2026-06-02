@@ -74,6 +74,7 @@ Plus a **custom** provider — point at any OpenAI-compatible endpoint (llama.cp
 
 - **OpenAI-compatible** — `POST /v1/chat/completions` and `GET /v1/models` work with the official OpenAI SDKs and any OpenAI-compatible client (LangChain, LlamaIndex, Continue, Hermes, etc.). Just change `base_url`.
 - **Responses API** — `POST /v1/responses` (the wire format current Codex CLI versions require) is implemented as a translating shim over the same router, with full streaming events and tool calls.
+- **Editor autocomplete** — `POST /v1/completions` translates legacy prompt/suffix requests into the same router, so VS Code ghost-text clients such as Continue can use FreeLLMAPI for inline suggestions.
 - **Streaming and non-streaming** — Server-Sent Events for `stream: true`, JSON response otherwise. Every provider adapter implements both.
 - **Tool calling** — OpenAI-style `tools` / `tool_choice` requests are passed through, and assistant `tool_calls` + `tool` role follow-up messages round-trip across providers.
 - **Automatic fallover** — If the chosen provider returns a 429, 5xx, or times out, the router skips it, puts the key on a short cooldown, and retries on the next model in your fallback chain (up to 20 attempts).
@@ -91,10 +92,8 @@ Plus a **custom** provider — point at any OpenAI-compatible endpoint (llama.cp
 
 The scope is deliberately narrow. If a feature isn't on this list and isn't below, assume it isn't there yet.
 
-- **Embeddings** (`/v1/embeddings`)
 - **Image generation** (`/v1/images/*`)
 - **Audio / speech** (`/v1/audio/*`)
-- **Legacy completions** (`/v1/completions`) — only the chat endpoint is implemented
 - **Moderation** (`/v1/moderations`)
 - **`n > 1`** (multiple completions per request)
 - **Per-user billing / multi-tenant auth** — single-user by design
@@ -226,6 +225,30 @@ stream = client.chat.completions.create(
 )
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
+```
+
+**VS Code ghost-text autocomplete (Continue)**
+
+FreeLLMAPI exposes `/v1/completions` for editor autocomplete clients that send legacy OpenAI prompt/suffix requests. Example Continue config:
+
+```yaml
+models:
+  - name: FreeLLMAPI Autocomplete
+    provider: openai
+    model: auto
+    apiBase: http://localhost:3001/v1
+    apiKey: freellmapi-your-unified-key
+    useLegacyCompletionsEndpoint: true
+    roles:
+      - autocomplete
+```
+
+Enable inline suggestions in VS Code:
+
+```json
+{
+  "editor.inlineSuggest.enabled": true
+}
 ```
 
 **Tool calling**

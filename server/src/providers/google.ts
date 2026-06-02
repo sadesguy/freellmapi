@@ -335,6 +335,9 @@ export class GoogleProvider extends BaseProvider {
         temperature: options?.temperature,
         maxOutputTokens: options?.max_tokens,
         topP: options?.top_p,
+        stopSequences: options?.stop === undefined
+          ? undefined
+          : (Array.isArray(options.stop) ? options.stop : [options.stop]),
       },
       tools: toGeminiTools(options?.tools),
       toolConfig: toGeminiToolConfig(options?.tool_choice),
