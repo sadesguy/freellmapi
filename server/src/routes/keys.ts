@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
+import { resolveProvider } from '../providers/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 
 export const keysRouter = Router();
@@ -15,9 +16,11 @@ const PLATFORMS = [
   'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode', 'custom',
 ] as const;
 
+// `key` is optional so keyless providers (Kilo's anonymous gateway) can be added
+// without one; the handler enforces a non-empty key for everyone else.
 const addKeySchema = z.object({
   platform: z.enum(PLATFORMS),
-  key: z.string().min(1),
+  key: z.string().optional(),
   label: z.string().optional(),
 });
 
@@ -65,10 +68,40 @@ keysRouter.post('/', (req: Request, res: Response) => {
     return;
   }
 
-  const { platform, key, label } = parsed.data;
-  const { encrypted, iv, authTag } = encrypt(key);
+  const { platform, label } = parsed.data;
+  const isKeyless = resolveProvider(platform)?.keyless === true;
+  const rawKey = parsed.data.key?.trim() ?? '';
+
+  if (!isKeyless && !rawKey) {
+    res.status(400).json({ error: { message: 'key is required' } });
+    return;
+  }
+
+  // Keyless providers (Kilo anon) store a sentinel so routing sees the platform
+  // as configured; the provider omits the auth header on outgoing calls.
+  const keyToStore = isKeyless ? (rawKey || 'no-key') : rawKey;
 
   const db = getDb();
+
+  // A keyless provider needs only one sentinel row — re-enable an existing one
+  // instead of piling up duplicates each time the user clicks "Add".
+  if (isKeyless) {
+    const existing = db.prepare('SELECT id FROM api_keys WHERE platform = ? LIMIT 1').get(platform) as { id: number } | undefined;
+    if (existing) {
+      db.prepare("UPDATE api_keys SET enabled = 1, status = 'unknown' WHERE id = ?").run(existing.id);
+      res.status(200).json({
+        id: existing.id,
+        platform,
+        label: label ?? '',
+        maskedKey: maskKey(keyToStore),
+        status: 'unknown',
+        enabled: true,
+      });
+      return;
+    }
+  }
+
+  const { encrypted, iv, authTag } = encrypt(keyToStore);
   const result = db.prepare(`
     INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
     VALUES (?, ?, ?, ?, ?, 'unknown', 1)
@@ -78,7 +111,7 @@ keysRouter.post('/', (req: Request, res: Response) => {
     id: result.lastInsertRowid,
     platform,
     label: label ?? '',
-    maskedKey: maskKey(key),
+    maskedKey: maskKey(keyToStore),
     status: 'unknown',
     enabled: true,
   });
@@ -173,12 +206,28 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const result = db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
-
-  if (result.changes === 0) {
+  const row = db.prepare('SELECT platform FROM api_keys WHERE id = ?').get(id) as { platform: string } | undefined;
+  if (!row) {
     res.status(404).json({ error: { message: 'Key not found' } });
     return;
   }
+
+  const remove = db.transaction(() => {
+    db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
+    // Custom models exist only because POST /custom registered them alongside
+    // this endpoint key (#117) — they can't route without it. Built-in
+    // platforms keep their seeded catalog rows, but once the last custom key
+    // is gone, orphaned custom models would linger in the fallback chain
+    // forever (#189), so cascade them away.
+    if (row.platform === 'custom') {
+      const remaining = db.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'custom'").get() as { n: number };
+      if (remaining.n === 0) {
+        db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom')").run();
+        db.prepare("DELETE FROM models WHERE platform = 'custom'").run();
+      }
+    }
+  });
+  remove();
 
   res.json({ success: true });
 });

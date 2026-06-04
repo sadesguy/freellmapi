@@ -30,7 +30,10 @@ function GetKeyLink({ url }: { url: string }) {
 // `url` points to each provider's key-management / signup page so the Keys page
 // can show a "Get API key" shortcut (#137). OpenCode Zen's key is free from
 // opencode.ai/auth — no card needed; billing only applies to paid models (#128).
-const PLATFORMS: { value: Platform; label: string; url: string }[] = [
+// `keyless: true` providers (Kilo's anonymous free tier) need no API key — the
+// form disables the key field and submits a sentinel the backend stores so
+// routing treats the platform as configured.
+const PLATFORMS: { value: Platform; label: string; url: string; keyless?: boolean }[] = [
   { value: 'google', label: 'Google AI Studio', url: 'https://aistudio.google.com/apikey' },
   { value: 'groq', label: 'Groq', url: 'https://console.groq.com/keys' },
   { value: 'cerebras', label: 'Cerebras', url: 'https://cloud.cerebras.ai' },
@@ -43,7 +46,7 @@ const PLATFORMS: { value: Platform; label: string; url: string }[] = [
   { value: 'cloudflare', label: 'Cloudflare Workers AI', url: 'https://dash.cloudflare.com' },
   { value: 'zhipu', label: 'Zhipu AI (Z.ai)', url: 'https://z.ai/manage-apikey/apikey-list' },
   { value: 'ollama', label: 'Ollama Cloud', url: 'https://ollama.com/settings/keys' },
-  { value: 'kilo', label: 'Kilo Gateway (anon ok)', url: 'https://app.kilo.ai' },
+  { value: 'kilo', label: 'Kilo Gateway (no key needed)', url: 'https://app.kilo.ai', keyless: true },
   { value: 'pollinations', label: 'Pollinations (anon ok)', url: 'https://pollinations.ai' },
   { value: 'llm7', label: 'LLM7 (anon ok)', url: 'https://llm7.io' },
   { value: 'huggingface', label: 'HuggingFace Router', url: 'https://huggingface.co/settings/tokens' },
@@ -117,7 +120,7 @@ function UnifiedKeySection() {
   }
 
   return (
-    <section className="rounded-lg border bg-card p-5">
+    <section className="rounded-3xl border bg-card p-5">
       <div className="flex items-start justify-between gap-4 mb-3">
         <div>
           <h2 className="text-sm font-medium">Your unified API key</h2>
@@ -136,14 +139,14 @@ function UnifiedKeySection() {
       </div>
 
       {isError ? (
-        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2.5 text-xs text-destructive">
+        <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2.5 text-xs text-destructive">
           Can't reach the server on <code className="font-mono">{baseUrl.replace('/v1', '')}</code>. Make sure the
           backend is running — <code className="font-mono">npm run dev</code> starts both, and the server logs print
           under the <code className="font-mono">server</code> prefix.
         </div>
       ) : (
         <div className="flex items-center gap-2">
-          <code className="flex-1 font-mono text-xs bg-muted px-3 py-2 rounded-md select-all truncate tabular-nums">
+          <code className="flex-1 font-mono text-xs bg-muted px-3 py-2 rounded-lg select-all truncate tabular-nums">
             {showKey ? apiKey : masked}
           </code>
           <Button variant="outline" size="sm" onClick={() => setShowKey(!showKey)}>
@@ -158,8 +161,12 @@ function UnifiedKeySection() {
       <div className="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
         <span className="text-muted-foreground">Base URL</span>
         <code className="font-mono">{baseUrl}</code>
-        <span className="text-muted-foreground">Endpoint</span>
+        <span className="text-muted-foreground">Chat</span>
         <code className="font-mono">/v1/chat/completions</code>
+        <span className="text-muted-foreground">Responses</span>
+        <code className="font-mono">/v1/responses</code>
+        <span className="text-muted-foreground">Embeddings</span>
+        <code className="font-mono">/v1/embeddings <span className="text-muted-foreground">— model: "auto" or a family from the Embeddings tab</span></code>
       </div>
     </section>
   )
@@ -199,7 +206,7 @@ function CustomProviderSection() {
         gateway. Add each model you want routed; they all share the one endpoint. The API key is optional
         (most local servers don't need one).
       </p>
-      <form onSubmit={submit} className="flex flex-wrap items-end gap-3 rounded-lg border p-4 bg-card">
+      <form onSubmit={submit} className="flex flex-wrap items-end gap-3 rounded-3xl border p-4 bg-card">
         <div className="space-y-1.5 flex-1 min-w-[240px]">
           <Label className="text-xs">Base URL</Label>
           <Input
@@ -356,12 +363,15 @@ export default function KeysPage() {
   }, [editingKeyId])
 
   const needsAccountId = platform === 'cloudflare'
+  const isKeyless = PLATFORMS.find(p => p.value === platform)?.keyless ?? false
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!platform || !apiKey) return
+    if (!platform) return
+    if (!isKeyless && !apiKey) return
     if (needsAccountId && !accountId) return
-    const key = needsAccountId ? `${accountId}:${apiKey}` : apiKey
+    // Keyless providers submit an empty key; the backend stores a sentinel.
+    const key = isKeyless ? '' : (needsAccountId ? `${accountId}:${apiKey}` : apiKey)
     addKey.mutate({ platform, key, label: label || undefined })
   }
 
@@ -392,7 +402,7 @@ export default function KeysPage() {
 
         <section>
           <h2 className="text-sm font-medium mb-3">Add a provider key</h2>
-          <form onSubmit={handleSubmit} className="flex flex-wrap items-end gap-3 rounded-lg border p-4 bg-card">
+          <form onSubmit={handleSubmit} className="flex flex-wrap gap-3 rounded-3xl border p-4 bg-card">
             <div className="space-y-1.5">
               <Label className="text-xs">Platform</Label>
               <Select value={platform} onValueChange={(v) => setPlatform(v as Platform)}>
@@ -425,24 +435,32 @@ export default function KeysPage() {
               <Label className="text-xs">{needsAccountId ? 'API token' : 'API key'}</Label>
               <Input
                 type="password"
-                value={apiKey}
+                value={isKeyless ? '' : apiKey}
                 onChange={e => setApiKey(e.target.value)}
-                placeholder={needsAccountId ? 'Bearer token' : 'paste key here'}
+                placeholder={isKeyless ? 'No API key needed' : (needsAccountId ? 'Bearer token' : 'paste key here')}
                 className="font-mono text-xs"
+                disabled={isKeyless}
               />
+              {isKeyless && (
+                <p className="text-[11px] text-muted-foreground">
+                  No API key needed — this provider's free tier is anonymous (rate-limited per IP).
+                </p>
+              )}
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">Label</Label>
-              <Input
-                value={label}
-                onChange={e => setLabel(e.target.value)}
-                placeholder="optional"
-                className="w-[160px]"
-              />
+              <div className="flex flex-wrap items-center space-x-3">
+                <Input
+                  value={label}
+                  onChange={e => setLabel(e.target.value)}
+                  placeholder="optional"
+                  className="w-[160px]"
+                />
+                <Button type="submit" size="sm" disabled={!platform || (!isKeyless && !apiKey) || (needsAccountId && !accountId) || addKey.isPending}>
+                  {addKey.isPending ? 'Adding…' : isKeyless ? 'Enable' : 'Add key'}
+                </Button>
+              </div>
             </div>
-            <Button type="submit" size="sm" disabled={!platform || !apiKey || (needsAccountId && !accountId) || addKey.isPending}>
-              {addKey.isPending ? 'Adding…' : 'Add key'}
-            </Button>
           </form>
           {addKey.isError && (
             <p className="text-destructive text-xs mt-2">{(addKey.error as Error).message}</p>
@@ -456,7 +474,7 @@ export default function KeysPage() {
           {isLoading ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
           ) : keys.length === 0 ? (
-            <div className="rounded-lg border border-dashed p-8 text-center">
+            <div className="rounded-3xl border border-dashed p-8 text-center">
               <p className="text-sm text-muted-foreground">
                 No provider keys yet. Add one above to start routing.
               </p>
@@ -481,7 +499,7 @@ export default function KeysPage() {
                       {group.keys.length} key{group.keys.length === 1 ? '' : 's'}
                     </span>
                   </div>
-                  <div className="rounded-lg border divide-y bg-card overflow-hidden">
+                  <div className="rounded-2xl border divide-y bg-card overflow-hidden">
                     {group.keys.map(k => {
                       const h = healthKeyMap.get(k.id)
                       const status = h?.status ?? k.status

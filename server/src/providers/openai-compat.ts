@@ -28,6 +28,7 @@ export class OpenAICompatProvider extends BaseProvider {
     extraHeaders?: Record<string, string>;
     validateUrl?: string;
     timeoutMs?: number;
+    keyless?: boolean;
   }) {
     super();
     this.platform = opts.platform;
@@ -36,6 +37,14 @@ export class OpenAICompatProvider extends BaseProvider {
     this.extraHeaders = opts.extraHeaders ?? {};
     this.validateUrl = opts.validateUrl;
     this.timeoutMs = opts.timeoutMs ?? 15000;
+    this.keyless = opts.keyless ?? false;
+  }
+
+  /** Keyless providers (Kilo's anonymous free tier) must send NO Authorization
+   * header — a stored sentinel like `Bearer no-key` could be treated as an
+   * invalid key. Everyone else sends the bearer as usual. */
+  private authHeader(apiKey: string): Record<string, string> {
+    return this.keyless ? {} : { 'Authorization': `Bearer ${apiKey}` };
   }
 
   async chatCompletion(
@@ -47,7 +56,7 @@ export class OpenAICompatProvider extends BaseProvider {
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        ...this.authHeader(apiKey),
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
@@ -69,7 +78,19 @@ export class OpenAICompatProvider extends BaseProvider {
       throw new Error(`${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
     }
 
-    const data = await res.json() as ChatCompletionResponse;
+    let data: ChatCompletionResponse;
+    try {
+      data = await res.json() as ChatCompletionResponse;
+    } catch {
+      // A 200 whose body isn't a single JSON document — typically a base URL
+      // pointing at a non-OpenAI-compatible API (e.g. Ollama's native NDJSON
+      // /api endpoints instead of /v1, #189). Surface what's wrong instead of
+      // the raw JSON.parse position error.
+      throw new Error(
+        `${this.name} returned 200 with a non-JSON body — the endpoint is not OpenAI-compatible. ` +
+        `Check the base URL (for Ollama use http://host:11434/v1, for llama.cpp/vLLM/LM Studio the /v1 path).`,
+      );
+    }
     normalizeChoices(data);
     data._routed_via = { platform: this.platform, model: modelId };
     return data;
@@ -84,7 +105,7 @@ export class OpenAICompatProvider extends BaseProvider {
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        ...this.authHeader(apiKey),
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
@@ -148,7 +169,7 @@ export class OpenAICompatProvider extends BaseProvider {
     const res = await this.fetchWithTimeout(url, {
       method: 'GET',
       headers: {
-        'Authorization': `Bearer ${apiKey}`,
+        ...this.authHeader(apiKey),
         ...this.extraHeaders,
       },
     }, 30000);

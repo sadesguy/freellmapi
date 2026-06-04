@@ -3,11 +3,13 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage } from '@freellmapi/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit } from '../services/ratelimit.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
+import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS } from '../services/ratelimit.js';
 import { pruneRequestAnalytics } from '../services/request-retention.js';
+import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
+import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 
 export const proxyRouter = Router();
@@ -250,7 +252,23 @@ export function isRetryableError(err: any): boolean {
     // limits, unsupported params). The matching pattern is "api error 400"
     // which comes from the OpenAI-compat provider's error formatting, not
     // a bare "400" which is deliberately non-retryable for validation errors.
-    || msg.includes('api error 400');
+    || msg.includes('api error 400')
+    // 402: this provider/key is out of credits (e.g. HuggingFace Router
+    // "API error 402: Payment required"). The SAME model often lives on another
+    // provider (Kimi K2.6 is on HF + Cloudflare + NVIDIA), so fail over instead
+    // of killing the workflow. Paired with a long cooldown (isPaymentRequiredError)
+    // so we don't re-hammer the broke key every retry.
+    || isPaymentRequiredError(err);
+}
+
+// A 402 Payment Required / out-of-credits error. Distinct from a transient 429:
+// it won't recover on the next window, so the caller benches the model+key with
+// PAYMENT_REQUIRED_COOLDOWN_MS (a full day) rather than the 90s transient cooldown.
+export function isPaymentRequiredError(err: any): boolean {
+  const msg = (err.message ?? '').toLowerCase();
+  return msg.includes('402') || msg.includes('payment required')
+    || msg.includes('insufficient_quota') || msg.includes('insufficient credit')
+    || msg.includes('insufficient balance');
 }
 
 // Pull the incremental text out of a streaming chunk for token counting.
@@ -263,12 +281,11 @@ export function streamChunkText(chunk: any): string {
   return chunk?.choices?.[0]?.delta?.content ?? '';
 }
 
-// OpenAI-compatible embeddings endpoint. The chat key store is per-model and
-// chat-specific, so embeddings use their own dedicated key via the
-// EMBEDDINGS_GOOGLE_KEY env var, routed to Google's embedding API (Gemini
-// `text-embedding-004` by default). Same unified-key auth as the rest of /v1.
-// Lets downstream clients (e.g. RAG apps) get embeddings through the gateway
-// with no extra provider wiring. Returns 503 when no embeddings key is set.
+// OpenAI-compatible embeddings endpoint, routed through the embeddings family
+// catalog: `model: "auto"` (or omitted) → the configured default family; a
+// family name or provider model id → that family's provider chain. Failover
+// only happens WITHIN a family (same model on another provider) — never across
+// models, since vectors from different models are incompatible.
 const EmbeddingsBody = z.object({
   model: z.string().optional(),
   input: z.union([z.string(), z.array(z.string())]),
@@ -281,49 +298,25 @@ proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
     return;
   }
-  const googleKey = process.env.EMBEDDINGS_GOOGLE_KEY;
-  if (!googleKey) {
-    res.status(503).json({
-      error: { message: 'Embeddings not configured on this gateway (set EMBEDDINGS_GOOGLE_KEY)', type: 'server_error' },
-    });
-    return;
-  }
   const parsed = EmbeddingsBody.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: 'Invalid request: `input` is required', type: 'invalid_request_error' } });
     return;
   }
   const inputs = Array.isArray(parsed.data.input) ? parsed.data.input : [parsed.data.input];
-  // gemini-embedding-001 is the current Generative Language embedding model
-  // (text-embedding-004 isn't exposed on this API tier). Callers can override.
-  const requested = parsed.data.model && parsed.data.model !== 'auto' ? parsed.data.model : 'gemini-embedding-001';
-  const model = requested.startsWith('models/') ? requested : `models/${requested}`;
   try {
-    // These models support :embedContent (single), not :batchEmbedContents — so
-    // fan out one call per input and reassemble in input order.
-    const vectors = await Promise.all(
-      inputs.map(async (text) => {
-        const url = `https://generativelanguage.googleapis.com/v1beta/${model}:embedContent?key=${googleKey}`;
-        const r = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: { parts: [{ text }] } }),
-        });
-        if (!r.ok) {
-          throw new Error(`upstream ${r.status}: ${(await r.text()).slice(0, 200)}`);
-        }
-        const j = (await r.json()) as { embedding?: { values: number[] } };
-        return j.embedding?.values ?? [];
-      }),
-    );
+    const result = await runEmbeddings(parsed.data.model, inputs);
     res.json({
       object: 'list',
-      data: vectors.map((values, i) => ({ object: 'embedding', index: i, embedding: values })),
-      model: requested,
-      usage: { prompt_tokens: 0, total_tokens: 0 },
+      data: result.vectors.map((values, i) => ({ object: 'embedding', index: i, embedding: values })),
+      model: result.family,
+      provider: result.platform,
+      usage: { prompt_tokens: result.inputTokens, total_tokens: result.inputTokens },
     });
   } catch (err: any) {
-    res.status(502).json({ error: { message: `embedding error: ${err?.message ?? 'unknown'}`, type: 'server_error' } });
+    const status = err instanceof EmbeddingsError ? err.status : 502;
+    const type = status === 400 ? 'invalid_request_error' : status === 429 ? 'rate_limit_error' : 'server_error';
+    res.status(status).json({ error: { message: `embedding error: ${err?.message ?? 'unknown'}`, type } });
   }
 });
 
@@ -695,6 +688,23 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     n + (Array.isArray(m.content) ? m.content.filter(b => (b as { type?: string })?.type === 'image_url' || (b as { type?: string })?.type === 'image').length : 0), 0);
   const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + (max_tokens ?? 1000);
 
+  // Tool-bearing requests must route to a model that emits STRUCTURED
+  // tool_calls. A model without real function-calling support serializes the
+  // call into its text answer — the request "succeeds" but the client's tool
+  // loop sees nothing, which is strictly worse than an error. Same up-front
+  // gate pattern as vision above.
+  const wantsTools = (tools?.length ?? 0) > 0;
+  if (wantsTools && !hasEnabledToolsModel()) {
+    res.status(422).json({
+      error: {
+        message: 'This request includes tools, but no tool-capable model is enabled. Enable a tool-calling model (e.g. GPT-OSS 120B, Gemini 3.5 Flash, GLM-4.7) in the Fallback Chain.',
+        type: 'invalid_request_error',
+        code: 'no_tools_model',
+      },
+    });
+    return;
+  }
+
   // Explicit `model` field pins routing. If the catalog has no enabled row
   // matching the requested id, return 400 — silently auto-routing to a
   // different model would be surprising to OpenAI-compatible clients.
@@ -731,7 +741,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage);
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage, wantsTools);
     } catch (err: any) {
       // No more models available
       if (lastError) {
@@ -787,9 +797,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
 
           if (!streamStarted) {
-            // Upstream returned no chunks — emit minimal successful stream.
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+            // Upstream returned zero chunks — an empty completion in stream
+            // clothing. No headers are out yet, so fail over to the next model
+            // instead of handing the client a valid-looking empty stream
+            // (production case: nemotron-3-super returning nothing on large
+            // contexts while the request logs as success).
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (stream produced no chunks)');
+            skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+            setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+            recordRateLimitHit(route.modelDbId);
+            lastError = new Error(`empty completion from ${route.displayName}`);
+            continue;
           }
           res.write('data: [DONE]\n\n');
           res.end();
@@ -821,6 +839,20 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
         );
 
+        // Empty completion (no text, no tool calls) → fail over rather than
+        // return a transport-level "success" the caller can't act on. Mirrors
+        // the zero-chunk streaming case above.
+        const respMsg = result.choices?.[0]?.message;
+        const respText = contentToString(respMsg?.content ?? '');
+        if (!respText && (respMsg?.tool_calls?.length ?? 0) === 0) {
+          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
+          skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+          setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          recordRateLimitHit(route.modelDbId);
+          lastError = new Error(`empty completion from ${route.displayName}`);
+          continue;
+        }
+
         const totalTokens = result.usage?.total_tokens ?? 0;
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
@@ -828,6 +860,18 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+        // Repair double-encoded tool arguments against the request's tool
+        // schemas (e.g. GLM emitting an array parameter as a JSON string),
+        // so strict clients don't reject the call. Schema-gated — a true
+        // string parameter is never touched. See lib/tool-args.ts.
+        if (respMsg?.tool_calls?.length) {
+          const schemas = toolSchemaMap(tools);
+          for (const tc of respMsg.tool_calls) {
+            if (tc?.function?.arguments != null) {
+              tc.function.arguments = repairToolArguments(tc.function.arguments, schemas.get(tc.function.name));
+            }
+          }
+        }
         // Normalize array-shaped message.content to a string on the way out (#166).
         res.json(normalizeOutboundContent(result));
 
@@ -852,10 +896,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           route.platform,
           route.modelId,
           route.keyId,
-          getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
-            rpd: route.rpdLimit,
-            tpd: route.tpdLimit,
-          }),
+          isPaymentRequiredError(err)
+            ? PAYMENT_REQUIRED_COOLDOWN_MS
+            : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
+                rpd: route.rpdLimit,
+                tpd: route.tpdLimit,
+              }),
         );
         recordRateLimitHit(route.modelDbId);
         lastError = err;
